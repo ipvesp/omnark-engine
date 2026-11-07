@@ -13,6 +13,8 @@
 #include <ctime>
 #include <thread>
 #include <sstream>
+#include <array>
+#include <atomic>
 #include "nlohmann/json.hpp"
 #include "wslcsdk.h"
 
@@ -1168,16 +1170,22 @@ static std::string handle_http(WslcSession session, const std::wstring& session_
     return http_error(501, "Not Implemented", "This Engine API endpoint is not implemented by Omnark");
 }
 
-static int serve_http_pipe(WslcSession session, HANDLE stop, HANDLE terminated, const std::wstring& pipe_name, const std::wstring& session_name) {
+static int serve_http_pipe(WslcSession session, HANDLE stop, HANDLE terminated, const std::wstring& pipe_name,
+    const std::wstring& session_name, bool first_instance, HANDLE ready_event = nullptr, std::atomic<bool>* first_created = nullptr) {
     SECURITY_ATTRIBUTES attributes = {};
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     if (!user_only_security(attributes, descriptor)) return 1;
     int result = 0;
+    bool first_pipe = true;
     while (true) {
-        HANDLE pipe = CreateNamedPipeW(pipe_name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        HANDLE pipe = CreateNamedPipeW(pipe_name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+            | (first_instance && first_pipe ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-            1, 65536, 16384, 0, &attributes);
-        if (pipe == INVALID_HANDLE_VALUE) { result = 1; break; }
+            4, 65536, 16384, 0, &attributes);
+        if (pipe == INVALID_HANDLE_VALUE) { if (ready_event) SetEvent(ready_event); result = 1; break; }
+        first_pipe = false;
+        if (first_created) first_created->store(true);
+        if (ready_event) { SetEvent(ready_event); ready_event = nullptr; }
         OVERLAPPED connection = {};
         connection.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!connection.hEvent) { CloseHandle(pipe); result = 1; break; }
@@ -1328,18 +1336,37 @@ int wmain(int argc, wchar_t** argv) {
         if (FAILED(WslcGetSessionTerminationEvent(session, &terminated))) break;
         std::printf("Nodecub engine ready\n");
         std::fflush(stdout);
-        int http_result = 1;
-        std::thread http_server([&] {
-            const HRESULT thread_initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            if (SUCCEEDED(thread_initialized)) {
-                http_result = serve_http_pipe(session, stop_event, terminated, http_pipe_name, session_name);
-                CoUninitialize();
-            }
-        });
+        constexpr size_t http_workers = 4;
+        std::array<int, http_workers> http_results = {1, 1, 1, 1};
+        std::vector<std::thread> http_servers;
+        std::atomic<bool> first_created{false};
+        HANDLE http_ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!http_ready) break;
+        auto launch_http_worker = [&](size_t index) {
+            http_servers.emplace_back([&, index] {
+                const HRESULT thread_initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                if (SUCCEEDED(thread_initialized)) {
+                    http_results[index] = serve_http_pipe(session, stop_event, terminated, http_pipe_name, session_name,
+                        index == 0, index == 0 ? http_ready : nullptr, index == 0 ? &first_created : nullptr);
+                    CoUninitialize();
+                } else if (index == 0) SetEvent(http_ready);
+            });
+        };
+        launch_http_worker(0);
+        const bool first_ready = WaitForSingleObject(http_ready, 10000) == WAIT_OBJECT_0 && first_created.load();
+        if (!first_ready) {
+            SetEvent(stop_event);
+            for (auto& worker : http_servers) worker.join();
+            CloseHandle(http_ready);
+            result = 1;
+            break;
+        }
+        for (size_t index = 1; index < http_workers; ++index) launch_http_worker(index);
+        CloseHandle(http_ready);
         result = serve_pipe(session, stop_event, terminated, timeout, pipe_name);
         SetEvent(stop_event);
-        http_server.join();
-        if (http_result != 0) result = 1;
+        for (auto& worker : http_servers) worker.join();
+        if (std::any_of(http_results.begin(), http_results.end(), [](int code) { return code != 0; })) result = 1;
     } while (false);
     if (error) CoTaskMemFree(error);
     if (session) WslcReleaseSession(session);

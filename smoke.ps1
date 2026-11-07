@@ -214,6 +214,16 @@ try {
             if ($LASTEXITCODE -ne 0 -or $cliCreate -notmatch '^[a-f0-9]{64}$') { throw 'Docker CLI create failed.' }
             $cliStart = & $docker.Source --host $hostAddress start $cliContainer
             if ($LASTEXITCODE -ne 0 -or $cliStart -ne $cliContainer) { throw 'Docker CLI start failed.' }
+            $waitOutput = Join-Path $storage 'docker-wait.txt'
+            $waitError = Join-Path $storage 'docker-wait-error.txt'
+            $waitProcess = Start-Process -FilePath $docker.Source -ArgumentList @('--host', $hostAddress, 'wait', $cliContainer) -RedirectStandardOutput $waitOutput -RedirectStandardError $waitError -PassThru -WindowStyle Hidden
+            Start-Sleep -Milliseconds 750
+            if ($waitProcess.HasExited) { throw "Docker CLI wait exited before the container stopped: $(Get-Content $waitError -Raw)" }
+            $pingTimer = [Diagnostics.Stopwatch]::StartNew()
+            $concurrentPing = Invoke-EngineHttp 'GET' '/_ping'
+            $concurrentInfo = Invoke-EngineHttp 'GET' '/v1.40/info'
+            $pingTimer.Stop()
+            if ($concurrentPing -notmatch '^HTTP/1\.1 200 OK' -or $concurrentInfo -notmatch '"ContainersRunning"' -or $pingTimer.ElapsedMilliseconds -gt 3000) { throw "Engine API was blocked by container wait: $($pingTimer.ElapsedMilliseconds) ms" }
             $cliTop = & $docker.Source --host $hostAddress top $cliContainer
             if ($LASTEXITCODE -ne 0 -or ($cliTop -join "`n") -notmatch 'sleep') { throw "Docker CLI top failed: $cliTop" }
             $cliLogs = ''
@@ -232,12 +242,14 @@ try {
             if ((Invoke-EngineHttp 'GET' "/v1.40/containers/$cliContainer/logs?stdout=1&stderr=1&follow=1") -notmatch '^HTTP/1\.1 501 Not Implemented') { throw 'Unsupported live log following was not rejected.' }
             $cliStop = & $docker.Source --host $hostAddress stop $cliContainer
             if ($LASTEXITCODE -ne 0 -or $cliStop -ne $cliContainer) { throw 'Docker CLI stop failed.' }
-            $cliWait = & $docker.Source --host $hostAddress wait $cliContainer
-            if ($LASTEXITCODE -ne 0 -or $cliWait -notmatch '^\d+$') { throw "Docker CLI wait failed: $cliWait" }
+            if (!$waitProcess.WaitForExit(10000)) { throw 'Docker CLI wait did not complete after stop.' }
+            $cliWait = (Get-Content -LiteralPath $waitOutput -Raw).Trim()
+            if ($waitProcess.ExitCode -ne 0 -or $cliWait -notmatch '^\d+$') { throw "Docker CLI wait failed: $cliWait $(Get-Content $waitError -Raw)" }
             $cliRemove = & $docker.Source --host $hostAddress rm $cliContainer
             if ($LASTEXITCODE -ne 0 -or $cliRemove -ne $cliContainer) { throw 'Docker CLI remove failed.' }
             Write-Host 'Docker CLI version, info, pull, images, image inspect, image tag, image rm, ps, container inspect, create, start, logs, stop, wait, and rm passed.'
         } finally {
+            if ($waitProcess -and !$waitProcess.HasExited) { $waitProcess.Kill(); $waitProcess.WaitForExit(5000) | Out-Null }
             try { $null = Invoke-Engine @{ op = 'remove'; name = $cliContainer } } catch { }
         }
     }
