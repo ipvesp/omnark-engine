@@ -1,4 +1,4 @@
-param([string]$EnginePath, [switch]$ProbeDockerCli)
+param([string]$EnginePath, [switch]$ProbeDockerCli, [switch]$ProbeNetworkOnly)
 
 $ErrorActionPreference = 'Stop'
 
@@ -70,6 +70,18 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Docker CLI empty container list failed.' }
     }
     if ((Invoke-EngineHttp 'GET' '/_ping') -notmatch '^HTTP/1\.1 200 OK') { throw 'API ping failed.' }
+    $networks = Invoke-EngineHttp 'GET' '/v1.40/networks'
+    if ($networks -notmatch '^HTTP/1\.1 200 OK' -or $networks -notmatch '"Name":"bridge"') { throw "API network list failed: $networks" }
+    $bridge = Invoke-EngineHttp 'GET' '/v1.40/networks/bridge'
+    if ($bridge -notmatch '^HTTP/1\.1 200 OK' -or $bridge -notmatch '"Driver":"bridge"') { throw "API network inspection failed: $bridge" }
+    if ((Invoke-EngineHttp 'GET' '/v1.40/networks/../bad') -notmatch '^HTTP/1\.1 400 Bad Request') { throw 'Unsafe network name was accepted.' }
+    if ($ProbeDockerCli) {
+        $networkOutput = & $docker.Source --host $hostAddress network ls --format '{{.Name}}'
+        if ($LASTEXITCODE -ne 0 -or $networkOutput -notcontains 'bridge') { throw "Docker CLI network list failed: $networkOutput" }
+        $bridgeDriver = & $docker.Source --host $hostAddress network inspect bridge --format '{{.Driver}}'
+        if ($LASTEXITCODE -ne 0 -or $bridgeDriver -ne 'bridge') { throw "Docker CLI network inspect failed: $bridgeDriver" }
+    }
+    if ($ProbeNetworkOnly) { Write-Host 'PASS: Engine API and Docker CLI network list/inspect.'; return }
     $version = Invoke-EngineHttp 'GET' '/version'
     if ($version -notmatch '"ApiVersion":"1\.40"') { throw "API version failed: $version" }
     if ((Invoke-EngineHttp 'GET' '/not-implemented') -notmatch '^HTTP/1\.1 501 Not Implemented') { throw 'Unsupported API endpoint was not rejected.' }
@@ -243,8 +255,13 @@ try {
             $cliStop = & $docker.Source --host $hostAddress stop $cliContainer
             if ($LASTEXITCODE -ne 0 -or $cliStop -ne $cliContainer) { throw 'Docker CLI stop failed.' }
             if (!$waitProcess.WaitForExit(10000)) { throw 'Docker CLI wait did not complete after stop.' }
+            $waitProcess.Refresh()
             $cliWait = (Get-Content -LiteralPath $waitOutput -Raw).Trim()
-            if ($waitProcess.ExitCode -ne 0 -or $cliWait -notmatch '^\d+$') { throw "Docker CLI wait failed: $cliWait $(Get-Content $waitError -Raw)" }
+            $waitStderr = Get-Content -LiteralPath $waitError -Raw
+            $stoppedState = (Invoke-Engine @{ op = 'inspect'; name = $cliContainer }).inspect.State
+            if ($cliWait -notmatch '^\d+$' -or ![string]::IsNullOrWhiteSpace($waitStderr) -or [int]$cliWait -ne [int]$stoppedState.ExitCode) {
+                throw "Docker CLI wait did not match the container exit code: output=$cliWait actual=$($stoppedState.ExitCode) stderr=$waitStderr"
+            }
             $cliRemove = & $docker.Source --host $hostAddress rm $cliContainer
             if ($LASTEXITCODE -ne 0 -or $cliRemove -ne $cliContainer) { throw 'Docker CLI remove failed.' }
             Write-Host 'Docker CLI version, info, pull, images, image inspect, image tag, image rm, ps, container inspect, create, start, logs, stop, wait, and rm passed.'
@@ -273,4 +290,3 @@ try {
     }
     if (Test-Path -LiteralPath $storage) { Write-Warning "Temporary test storage remains locked: $storage" }
 }
-

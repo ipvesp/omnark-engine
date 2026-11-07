@@ -398,6 +398,57 @@ static json list_session_containers(WslcSession session, const std::wstring& ses
     return {{"ok", true}, {"containers", std::move(rows)}};
 }
 
+static json inspect_session_network(const std::wstring& session_name, const std::string& name) {
+    if (!safe_name(name)) return { {"ok", false}, {"error", "Invalid network name or ID"} };
+    std::string output;
+    const std::wstring arguments = L"network inspect --format json " + std::wstring(name.begin(), name.end());
+    bool inspected = false;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        output.clear();
+        if (run_wslc_command(session_name, arguments, output, 60000, 15000)) { inspected = true; break; }
+        if (attempt < 7) Sleep(250);
+    }
+    if (!inspected)
+        return { {"ok", false}, {"error", "Network not found"} };
+    const json parsed = json::parse(output, nullptr, false);
+    if (!parsed.is_array() || parsed.size() != 1 || !parsed[0].is_object())
+        return { {"ok", false}, {"error", "Invalid network inspection response"} };
+    return { {"ok", true}, {"network", parsed[0]} };
+}
+
+static json list_session_networks(const std::wstring& session_name) {
+    std::string output;
+    if (!run_wslc_command(session_name, L"network list --format json", output, 1024 * 1024, 15000))
+        return { {"ok", false}, {"error", "Cannot list session networks"} };
+    json rows = json::array();
+    std::istringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (line.find_first_not_of(" \r\t") == std::string::npos) continue;
+        const json row = json::parse(line, nullptr, false);
+        if (!row.is_object()) return { {"ok", false}, {"error", "Invalid network list response"} };
+        const std::string name = row.value("Name", "");
+        const std::string id = row.value("ID", "");
+        if (!safe_name(name) || !safe_name(id)) return { {"ok", false}, {"error", "Invalid listed network identity"} };
+        const std::string raw_created = row.value("CreatedAt", "");
+        const size_t offset_at = raw_created.find(' ', 11);
+        if (raw_created.size() < 30 || raw_created[10] != ' ' || offset_at == std::string::npos
+            || raw_created.size() < offset_at + 10 || (raw_created[offset_at + 1] != '+' && raw_created[offset_at + 1] != '-')
+            || !std::all_of(raw_created.begin() + offset_at + 2, raw_created.begin() + offset_at + 6,
+                [](unsigned char ch) { return std::isdigit(ch) != 0; }))
+            return { {"ok", false}, {"error", "Invalid network creation time"} };
+        const std::string created = raw_created.substr(0, 10) + "T" + raw_created.substr(11, offset_at - 11)
+            + raw_created.substr(offset_at + 1, 3) + ":" + raw_created.substr(offset_at + 4, 2);
+        rows.push_back({{"Name", name}, {"Id", id}, {"Driver", row.value("Driver", "")},
+            {"Scope", row.value("Scope", "local")}, {"Created", created},
+            {"Internal", row.value("Internal", "false") == "true"},
+            {"EnableIPv6", row.value("IPv6", "false") == "true"},
+            {"Attachable", false}, {"Ingress", false}, {"Labels", json::object()}, {"Options", json::object()}});
+        if (rows.size() > 256) return { {"ok", false}, {"error", "Network list exceeds limit"} };
+    }
+    return { {"ok", true}, {"networks", std::move(rows)} };
+}
+
 static bool user_only_security(SECURITY_ATTRIBUTES& attributes, PSECURITY_DESCRIPTOR& descriptor) {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
@@ -1039,6 +1090,23 @@ static std::string handle_http(WslcSession session, const std::wstring& session_
         return body.size() <= 60000 ? http_reply(200, "OK", body)
             : http_error(502, "Bad Gateway", "Image inspection response exceeds limit");
     }
+    if (method == "GET" && (path == "/networks" || path == "/networks?filters=%7B%7D")) {
+        const json result = list_session_networks(session_name);
+        if (!result.value("ok", false)) return http_error(502, "Bad Gateway", result.value("error", "Network list failed"));
+        const std::string rows = result.at("networks").dump();
+        return rows.size() <= 60000 ? http_reply(200, "OK", rows)
+            : http_error(502, "Bad Gateway", "Network list exceeds response limit");
+    }
+    constexpr const char* network_prefix = "/networks/";
+    if (method == "GET" && path.rfind(network_prefix, 0) == 0) {
+        const std::string name = path.substr(std::strlen(network_prefix));
+        if (!safe_name(name)) return http_error(400, "Bad Request", "Invalid network name or ID");
+        const json result = inspect_session_network(session_name, name);
+        if (!result.value("ok", false)) return http_error(404, "Not Found", result.value("error", "Network not found"));
+        const std::string detail = result.at("network").dump();
+        return detail.size() <= 60000 ? http_reply(200, "OK", detail)
+            : http_error(502, "Bad Gateway", "Network inspection response exceeds limit");
+    }
     if (method == "GET" && (path == "/containers/json" || path.rfind("/containers/json?", 0) == 0)) {
         bool all = false;
         bool seen_all = false, seen_size = false;
@@ -1374,4 +1442,3 @@ int wmain(int argc, wchar_t** argv) {
     CoUninitialize();
     return result;
 }
-
