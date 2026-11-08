@@ -418,7 +418,13 @@ static json inspect_session_network(const std::wstring& session_name, const std:
 
 static json list_session_networks(const std::wstring& session_name) {
     std::string output;
-    if (!run_wslc_command(session_name, L"network list --format json", output, 1024 * 1024, 15000))
+    bool listed = false;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        output.clear();
+        if (run_wslc_command(session_name, L"network list --format json", output, 1024 * 1024, 15000)) { listed = true; break; }
+        if (attempt < 7) Sleep(250);
+    }
+    if (!listed)
         return { {"ok", false}, {"error", "Cannot list session networks"} };
     json rows = json::array();
     std::istringstream lines(output);
@@ -494,6 +500,176 @@ static std::string http_reply(int status, const std::string& reason, const std::
 
 static std::string http_error(int status, const std::string& reason, const std::string& message) {
     return http_reply(status, reason, json({{"message", message}}).dump());
+}
+
+static bool safe_ipv4(const std::string& value) {
+    if (value.empty() || value.size() > 15) return false;
+    in_addr address = {};
+    return InetPtonA(AF_INET, value.c_str(), &address) == 1;
+}
+
+static bool safe_ipv4_cidr(const std::string& value) {
+    const size_t slash = value.find('/');
+    if (slash == std::string::npos || !safe_ipv4(value.substr(0, slash))) return false;
+    const std::string prefix = value.substr(slash + 1);
+    if (prefix.empty() || prefix.size() > 2 || !std::all_of(prefix.begin(), prefix.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; })) return false;
+    const int bits = std::stoi(prefix);
+    return bits >= 1 && bits <= 32;
+}
+
+static bool safe_network_label(const std::string& value) {
+    return !value.empty() && value.size() <= 128 && std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+            || ch == '_' || ch == '-' || ch == '.' || ch == '/';
+    });
+}
+
+static std::string http_create_network(const std::wstring& session_name, const std::string& body) {
+    const json request = json::parse(body, nullptr, false);
+    if (!request.is_object() || !request.contains("Name") || !request["Name"].is_string())
+        return http_error(400, "Bad Request", "Network name is required");
+    const std::string name = request["Name"].get<std::string>();
+    if (!safe_name(name)) return http_error(400, "Bad Request", "Invalid network name");
+    for (auto it = request.begin(); it != request.end(); ++it) {
+        if (it.key() != "Name" && it.key() != "Driver" && it.key() != "CheckDuplicate" && it.key() != "Internal"
+            && it.key() != "EnableIPv4" && it.key() != "EnableIPv6" && it.key() != "Attachable"
+            && it.key() != "Ingress" && it.key() != "IPAM" && it.key() != "Labels" && it.key() != "Options"
+            && it.key() != "Scope" && it.key() != "ConfigOnly" && it.key() != "ConfigFrom")
+            return http_error(501, "Not Implemented", "Unsupported network create option: " + it.key());
+    }
+    const auto bool_option = [&](const char* key) -> int {
+        if (!request.contains(key) || request[key].is_null()) return 0;
+        if (!request[key].is_boolean()) return -1;
+        return request[key].get<bool>() ? 1 : 0;
+    };
+    if (bool_option("CheckDuplicate") < 0 || bool_option("Internal") < 0 || bool_option("EnableIPv4") < 0
+        || bool_option("EnableIPv6") < 0 || bool_option("Attachable") < 0 || bool_option("Ingress") < 0
+        || bool_option("ConfigOnly") < 0) return http_error(400, "Bad Request", "Invalid network boolean option");
+    if (bool_option("EnableIPv6") || bool_option("Attachable") || bool_option("Ingress") || bool_option("ConfigOnly"))
+        return http_error(501, "Not Implemented", "Unsupported network create mode");
+    if (request.contains("Driver") && !request["Driver"].is_null() && request["Driver"] != "" && request["Driver"] != "bridge")
+        return http_error(501, "Not Implemented", "Only bridge networks can be created");
+    if (request.contains("Scope") && !request["Scope"].is_null() && request["Scope"] != "" && request["Scope"] != "local")
+        return http_error(501, "Not Implemented", "Unsupported network scope");
+    if (request.contains("Options") && !request["Options"].is_null() && request["Options"] != json::object())
+        return http_error(501, "Not Implemented", "Network driver options are unsupported");
+    if (request.contains("ConfigFrom") && !request["ConfigFrom"].is_null() && request["ConfigFrom"] != json::object()
+        && request["ConfigFrom"] != json({{"Network", ""}}))
+        return http_error(501, "Not Implemented", "Network configuration inheritance is unsupported");
+    std::wstring arguments = L"network create";
+    if (bool_option("Internal") == 1) arguments += L" --internal";
+    if (request.contains("IPAM") && !request["IPAM"].is_null()) {
+        const json& ipam = request["IPAM"];
+        if (!ipam.is_object()) return http_error(400, "Bad Request", "Invalid IPAM configuration");
+        for (auto it = ipam.begin(); it != ipam.end(); ++it)
+            if (it.key() != "Driver" && it.key() != "Config" && it.key() != "Options")
+                return http_error(501, "Not Implemented", "Unsupported IPAM option");
+        if (ipam.contains("Driver") && !ipam["Driver"].is_null() && ipam["Driver"] != "" && ipam["Driver"] != "default")
+            return http_error(501, "Not Implemented", "Unsupported IPAM driver");
+        if (ipam.contains("Options") && !ipam["Options"].is_null() && ipam["Options"] != json::object())
+            return http_error(501, "Not Implemented", "IPAM options are unsupported");
+        const json config = !ipam.contains("Config") || ipam["Config"].is_null() ? json::array() : ipam["Config"];
+        if (!config.is_array() || config.size() > 1) return http_error(400, "Bad Request", "Only one IPAM subnet is supported");
+        if (!config.empty()) {
+            const json& subnet = config[0];
+            if (!subnet.is_object()) return http_error(400, "Bad Request", "Invalid IPAM subnet");
+            for (auto it = subnet.begin(); it != subnet.end(); ++it)
+                if (it.key() != "Subnet" && it.key() != "Gateway" && it.key() != "IPRange")
+                    return http_error(501, "Not Implemented", "Unsupported IPAM subnet option");
+            for (const char* key : {"Subnet", "Gateway", "IPRange"})
+                if (subnet.contains(key) && !subnet[key].is_null() && !subnet[key].is_string())
+                    return http_error(400, "Bad Request", "Invalid IPAM subnet value");
+            const std::string range = !subnet.contains("Subnet") || subnet["Subnet"].is_null() ? "" : subnet["Subnet"].get<std::string>();
+            const std::string gateway = !subnet.contains("Gateway") || subnet["Gateway"].is_null() ? "" : subnet["Gateway"].get<std::string>();
+            const std::string ip_range = !subnet.contains("IPRange") || subnet["IPRange"].is_null() ? "" : subnet["IPRange"].get<std::string>();
+            if ((!range.empty() && !safe_ipv4_cidr(range)) || (!gateway.empty() && !safe_ipv4(gateway))
+                || (!ip_range.empty() && !safe_ipv4_cidr(ip_range)) || (range.empty() && (!gateway.empty() || !ip_range.empty())))
+                return http_error(400, "Bad Request", "Invalid IPv4 IPAM configuration");
+            for (const auto& option : {std::pair<const char*, std::string>{"--subnet", range}, {"--gateway", gateway}, {"--ip-range", ip_range}})
+                if (!option.second.empty()) arguments += L" " + std::wstring(option.first, option.first + std::strlen(option.first)) + L" " + std::wstring(option.second.begin(), option.second.end());
+        }
+    }
+    if (request.contains("Labels") && !request["Labels"].is_null()) {
+        const json& labels = request["Labels"];
+        if (!labels.is_object() || labels.size() > 32) return http_error(400, "Bad Request", "Invalid network labels");
+        for (auto it = labels.begin(); it != labels.end(); ++it) {
+            if (!safe_network_label(it.key()) || !it.value().is_string()) return http_error(400, "Bad Request", "Invalid network label");
+            const std::string value = it.value().get<std::string>();
+            if ((!value.empty() && !safe_network_label(value)) || value.size() > 128) return http_error(400, "Bad Request", "Invalid network label value");
+            const std::string label = it.key() + "=" + value;
+            arguments += L" --label " + std::wstring(label.begin(), label.end());
+        }
+    }
+    if (inspect_session_network(session_name, name).value("ok", false)) return http_error(409, "Conflict", "Network already exists");
+    arguments += L" " + std::wstring(name.begin(), name.end());
+    std::string output;
+    if (!run_wslc_command(session_name, arguments, output, 60000, 30000))
+        return http_error(500, "Internal Server Error", "Network creation failed");
+    const json detail = inspect_session_network(session_name, name);
+    if (!detail.value("ok", false)) return http_error(502, "Bad Gateway", "Created network could not be inspected");
+    return http_reply(201, "Created", json({{"Id", detail.at("network").value("Id", "")}, {"Warning", ""}}).dump());
+}
+
+static std::string http_network_attachment(WslcSession session, const std::wstring& session_name,
+    const std::string& network, const std::string& body, bool connect) {
+    if (!safe_name(network)) return http_error(400, "Bad Request", "Invalid network name or ID");
+    const json request = json::parse(body, nullptr, false);
+    if (!request.is_object() || !request.contains("Container") || !request["Container"].is_string())
+        return http_error(400, "Bad Request", "Container name or ID is required");
+    const std::string container = request["Container"].get<std::string>();
+    if (!safe_name(container)) return http_error(400, "Bad Request", "Invalid container name or ID");
+    if (!inspect_session_network(session_name, network).value("ok", false))
+        return http_error(404, "Not Found", "Network not found");
+    if (!manage_container(session, {{"name", container}}, "inspect").value("ok", false))
+        return http_error(404, "Not Found", "Container not found");
+    std::wstring arguments = connect ? L"network connect" : L"network disconnect";
+    for (auto it = request.begin(); it != request.end(); ++it)
+        if (it.key() != "Container" && it.key() != "EndpointConfig" && it.key() != "Force")
+            return http_error(501, "Not Implemented", "Unsupported network attachment option");
+    if (!connect) {
+        if (request.contains("Force") && request["Force"] != false && !request["Force"].is_null())
+            return http_error(501, "Not Implemented", "Forced network disconnect is unsupported");
+        if (request.contains("EndpointConfig") && !request["EndpointConfig"].is_null())
+            return http_error(400, "Bad Request", "Disconnect does not accept endpoint configuration");
+    } else {
+        if (request.contains("Force") && !request["Force"].is_null())
+            return http_error(400, "Bad Request", "Connect does not accept Force");
+        if (request.contains("EndpointConfig") && !request["EndpointConfig"].is_null()) {
+            const json& endpoint = request["EndpointConfig"];
+            if (!endpoint.is_object()) return http_error(400, "Bad Request", "Invalid endpoint configuration");
+            for (auto it = endpoint.begin(); it != endpoint.end(); ++it)
+                if (it.key() != "IPAMConfig" && it.key() != "Aliases")
+                    return http_error(501, "Not Implemented", "Unsupported endpoint option");
+            if (endpoint.contains("IPAMConfig") && !endpoint["IPAMConfig"].is_null()) {
+                const json& ipam = endpoint["IPAMConfig"];
+                if (!ipam.is_object()) return http_error(400, "Bad Request", "Invalid endpoint IPAM configuration");
+                for (auto it = ipam.begin(); it != ipam.end(); ++it)
+                    if (it.key() != "IPv4Address") return http_error(501, "Not Implemented", "Unsupported endpoint IPAM option");
+                if (ipam.contains("IPv4Address") && !ipam["IPv4Address"].is_null() && !ipam["IPv4Address"].is_string())
+                    return http_error(400, "Bad Request", "Invalid endpoint IPv4 address");
+                const std::string ip = !ipam.contains("IPv4Address") || ipam["IPv4Address"].is_null() ? "" : ipam["IPv4Address"].get<std::string>();
+                if (!ip.empty()) {
+                    if (!safe_ipv4(ip)) return http_error(400, "Bad Request", "Invalid endpoint IPv4 address");
+                    arguments += L" --ip " + std::wstring(ip.begin(), ip.end());
+                }
+            }
+            if (endpoint.contains("Aliases") && !endpoint["Aliases"].is_null()) {
+                const json& aliases = endpoint["Aliases"];
+                if (!aliases.is_array() || aliases.size() > 16) return http_error(400, "Bad Request", "Invalid network aliases");
+                for (const auto& alias : aliases) {
+                    if (!alias.is_string()) return http_error(400, "Bad Request", "Invalid network alias");
+                    const std::string value = alias.get<std::string>();
+                    if (!safe_dns_name(value)) return http_error(400, "Bad Request", "Invalid network alias");
+                    arguments += L" --network-alias " + std::wstring(value.begin(), value.end());
+                }
+            }
+        }
+    }
+    arguments += L" " + std::wstring(network.begin(), network.end()) + L" " + std::wstring(container.begin(), container.end());
+    std::string output;
+    if (!run_wslc_command(session_name, arguments, output, 60000, 30000))
+        return http_error(409, "Conflict", connect ? "Network connect failed" : "Network disconnect failed");
+    return http_reply(200, "OK", "");
 }
 
 static bool http_body_length(const std::string& request, size_t header_end, size_t& length) {
@@ -1097,7 +1273,17 @@ static std::string handle_http(WslcSession session, const std::wstring& session_
         return rows.size() <= 60000 ? http_reply(200, "OK", rows)
             : http_error(502, "Bad Gateway", "Network list exceeds response limit");
     }
+    if (method == "POST" && path == "/networks/create") return http_create_network(session_name, body);
     constexpr const char* network_prefix = "/networks/";
+    if (method == "POST" && path.rfind(network_prefix, 0) == 0) {
+        const size_t action_at = path.find('/', std::strlen(network_prefix));
+        if (action_at != std::string::npos) {
+            const std::string name = path.substr(std::strlen(network_prefix), action_at - std::strlen(network_prefix));
+            const std::string action = path.substr(action_at + 1);
+            if (action == "connect" || action == "disconnect")
+                return http_network_attachment(session, session_name, name, body, action == "connect");
+        }
+    }
     if (method == "GET" && path.rfind(network_prefix, 0) == 0) {
         const std::string name = path.substr(std::strlen(network_prefix));
         if (!safe_name(name)) return http_error(400, "Bad Request", "Invalid network name or ID");
@@ -1106,6 +1292,17 @@ static std::string handle_http(WslcSession session, const std::wstring& session_
         const std::string detail = result.at("network").dump();
         return detail.size() <= 60000 ? http_reply(200, "OK", detail)
             : http_error(502, "Bad Gateway", "Network inspection response exceeds limit");
+    }
+    if (method == "DELETE" && path.rfind(network_prefix, 0) == 0) {
+        const std::string name = path.substr(std::strlen(network_prefix));
+        if (!safe_name(name)) return http_error(400, "Bad Request", "Invalid network name or ID");
+        if (name == "bridge" || name == "host" || name == "none") return http_error(403, "Forbidden", "Built-in networks cannot be removed");
+        if (!inspect_session_network(session_name, name).value("ok", false)) return http_error(404, "Not Found", "Network not found");
+        std::string output;
+        const std::wstring arguments = L"network remove " + std::wstring(name.begin(), name.end());
+        if (!run_wslc_command(session_name, arguments, output, 60000, 30000))
+            return http_error(409, "Conflict", "Network removal failed; it may still be in use");
+        return http_reply(204, "No Content", "");
     }
     if (method == "GET" && (path == "/containers/json" || path.rfind("/containers/json?", 0) == 0)) {
         bool all = false;
@@ -1383,17 +1580,33 @@ int wmain(int argc, wchar_t** argv) {
     const std::wstring http_pipe_name = test_instance ? std::wstring(L"\\\\.\\pipe\\OmnarkEngineApiTest-") + argv[3] : L"\\\\.\\pipe\\omnark_engine";
     const std::wstring event_name = test_instance ? std::wstring(L"Local\\NodecubEngineTestStop-") + argv[3] : stop_event_name;
     const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(initialized)) return 1;
+    if (FAILED(initialized)) {
+        std::fprintf(stderr, "COM initialization failed: 0x%08lx\n", static_cast<unsigned long>(initialized));
+        return 1;
+    }
     WslcSession session = nullptr;
     HANDLE stop_event = CreateEventW(nullptr, TRUE, FALSE, event_name.c_str());
-    if (!stop_event) { CoUninitialize(); return 1; }
+    if (!stop_event) {
+        std::fprintf(stderr, "Engine stop event creation failed: %lu\n", GetLastError());
+        CoUninitialize();
+        return 1;
+    }
     PWSTR error = nullptr;
     int result = 1;
     do {
         WslcComponentFlags missing = WSLC_COMPONENT_FLAG_NONE;
-        if (FAILED(WslcGetMissingComponents(&missing)) || missing != WSLC_COMPONENT_FLAG_NONE) break;
+        const HRESULT components = WslcGetMissingComponents(&missing);
+        if (FAILED(components) || missing != WSLC_COMPONENT_FLAG_NONE) {
+            std::fprintf(stderr, "WSL Containers prerequisites failed: 0x%08lx; missing flags: 0x%08lx\n",
+                static_cast<unsigned long>(components), static_cast<unsigned long>(missing));
+            break;
+        }
         WslcSessionSettings settings;
-        if (FAILED(WslcInitSessionSettings(session_name.c_str(), argv[1], &settings))) break;
+        const HRESULT settings_result = WslcInitSessionSettings(session_name.c_str(), argv[1], &settings);
+        if (FAILED(settings_result)) {
+            std::fprintf(stderr, "Session settings initialization failed: 0x%08lx\n", static_cast<unsigned long>(settings_result));
+            break;
+        }
         const HRESULT created = WslcCreateSession(&settings, &session, &error);
         if (FAILED(created)) {
             std::fprintf(stderr, "Session creation failed: 0x%08lx\n", static_cast<unsigned long>(created));
@@ -1442,3 +1655,4 @@ int wmain(int argc, wchar_t** argv) {
     CoUninitialize();
     return result;
 }
+

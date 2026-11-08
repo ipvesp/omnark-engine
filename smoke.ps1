@@ -51,12 +51,20 @@ function Invoke-EngineHttp([string]$method, [string]$path, [string]$body = '') {
 
 $process = $null
 $container = "omnark-smoke-$suffix"
+$engineStdout = Join-Path $storage 'engine.stdout.log'
+$engineStderr = Join-Path $storage 'engine.stderr.log'
 try {
-    $process = Start-Process -FilePath $engine -ArgumentList @($storage, '120000', $suffix) -PassThru -WindowStyle Hidden
+    $process = Start-Process -FilePath $engine -ArgumentList @($storage, '120000', $suffix) -PassThru -WindowStyle Hidden -RedirectStandardOutput $engineStdout -RedirectStandardError $engineStderr
     $ready = $false
     for ($attempt = 0; $attempt -lt 40; $attempt++) {
         Start-Sleep -Milliseconds 250
-        try { $null = Invoke-Engine @{ op = 'ping' }; $ready = $true; break } catch { if ($process.HasExited) { throw "Engine exited: $($process.ExitCode)" } }
+        try { $null = Invoke-Engine @{ op = 'ping' }; $ready = $true; break } catch {
+            if ($process.HasExited) {
+                $process.Refresh()
+                $details = if (Test-Path -LiteralPath $engineStderr) { (Get-Content -LiteralPath $engineStderr -Raw).Trim() } else { '' }
+                throw "Engine exited with code $($process.ExitCode). $details"
+            }
+        }
     }
     if (!$ready) { throw 'Test engine did not become ready.' }
     if ($ProbeDockerCli) {
@@ -75,13 +83,46 @@ try {
     $bridge = Invoke-EngineHttp 'GET' '/v1.40/networks/bridge'
     if ($bridge -notmatch '^HTTP/1\.1 200 OK' -or $bridge -notmatch '"Driver":"bridge"') { throw "API network inspection failed: $bridge" }
     if ((Invoke-EngineHttp 'GET' '/v1.40/networks/../bad') -notmatch '^HTTP/1\.1 400 Bad Request') { throw 'Unsafe network name was accepted.' }
+    if ((Invoke-EngineHttp 'POST' '/v1.40/networks/create' '{"Name":"../bad"}') -notmatch '^HTTP/1\.1 400 Bad Request') { throw 'Unsafe network creation was accepted.' }
+    if ((Invoke-EngineHttp 'POST' '/v1.40/networks/create' '{"Name":"bad-ipam","IPAM":{"Config":[{"Subnet":42}]}}') -notmatch '^HTTP/1\.1 400 Bad Request') { throw 'Malformed IPAM subnet was accepted.' }
+    if ((Invoke-EngineHttp 'POST' '/v1.40/networks/create' '{"Name":"bad-null","IPAM":{"Config":[{"Subnet":null,"Gateway":"10.0.0.1"}]}}') -notmatch '^HTTP/1\.1 400 Bad Request') { throw 'Null IPAM subnet bypassed validation.' }
+    $apiNetwork = "omnark-api-net-$suffix"
+    $networkBody = @{ Name = $apiNetwork; Driver = 'bridge'; Internal = $true; Labels = @{ 'com.omnark.test' = 'network' }; IPAM = @{ Driver = 'default'; Config = @(@{ Subnet = '10.253.91.0/24'; Gateway = '10.253.91.1' }) } } | ConvertTo-Json -Compress -Depth 8
+    $createdNetwork = Invoke-EngineHttp 'POST' '/v1.40/networks/create' $networkBody
+    if ($createdNetwork -notmatch '^HTTP/1\.1 201 Created' -or $createdNetwork -notmatch '"Id":"[a-f0-9]{64}"') { throw "API network creation failed: $createdNetwork" }
+    $networkDetail = Invoke-EngineHttp 'GET' "/v1.40/networks/$apiNetwork"
+    if ($networkDetail -notmatch '"Internal":true' -or $networkDetail -notmatch '10.253.91.0/24' -or $networkDetail -notmatch 'com.omnark.test') { throw 'Created API network lost its configuration.' }
+    if ((Invoke-EngineHttp 'POST' '/v1.40/images/create?fromImage=docker.io/library/alpine&tag=3.24') -notmatch '^HTTP/1\.1 200 OK') { throw 'Network attachment test image pull failed.' }
+    $networkContainer = "omnark-net-container-$suffix"
+    $containerBody = @{ Image = 'docker.io/library/alpine:3.24'; Cmd = @('/bin/sh', '-c', 'sleep 60') } | ConvertTo-Json -Compress
+    if ((Invoke-EngineHttp 'POST' "/v1.40/containers/create?name=$networkContainer" $containerBody) -notmatch '^HTTP/1\.1 201 Created') { throw 'Network attachment test container creation failed.' }
+    if ((Invoke-EngineHttp 'POST' "/v1.40/containers/$networkContainer/start") -notmatch '^HTTP/1\.1 204 No Content') { throw 'Network attachment test container start failed.' }
+    $badConnect = '{"Container":"' + $networkContainer + '","EndpointConfig":{"IPAMConfig":{"IPv4Address":42}}}'
+    if ((Invoke-EngineHttp 'POST' "/v1.40/networks/$apiNetwork/connect" $badConnect) -notmatch '^HTTP/1\.1 400 Bad Request') { throw 'Malformed endpoint IPv4 address was accepted.' }
+    $connectBody = @{ Container = $networkContainer; EndpointConfig = @{ Aliases = @('test.internal'); IPAMConfig = @{ IPv4Address = '10.253.91.10' } } } | ConvertTo-Json -Compress -Depth 8
+    if ((Invoke-EngineHttp 'POST' "/v1.40/networks/$apiNetwork/connect" $connectBody) -notmatch '^HTTP/1\.1 200 OK') { throw 'API network connect failed.' }
+    $attached = Invoke-EngineHttp 'GET' "/v1.40/networks/$apiNetwork"
+    if ($attached -notmatch $networkContainer -or $attached -notmatch '10.253.91.10') { throw 'API network endpoint was not attached.' }
+    $disconnectBody = @{ Container = $networkContainer } | ConvertTo-Json -Compress
+    if ((Invoke-EngineHttp 'POST' "/v1.40/networks/$apiNetwork/disconnect" $disconnectBody) -notmatch '^HTTP/1\.1 200 OK') { throw 'API network disconnect failed.' }
+    if ((Invoke-EngineHttp 'POST' "/v1.40/containers/$networkContainer/stop") -notmatch '^HTTP/1\.1 204 No Content') { throw 'Network attachment test container stop failed.' }
+    if ((Invoke-EngineHttp 'DELETE' "/v1.40/containers/$networkContainer") -notmatch '^HTTP/1\.1 204 No Content') { throw 'Network attachment test container cleanup failed.' }
+    if ((Invoke-EngineHttp 'DELETE' "/v1.40/networks/$apiNetwork") -notmatch '^HTTP/1\.1 204 No Content') { throw 'API network deletion failed.' }
+    if ((Invoke-EngineHttp 'GET' "/v1.40/networks/$apiNetwork") -notmatch '^HTTP/1\.1 404 Not Found') { throw 'Deleted API network still exists.' }
     if ($ProbeDockerCli) {
         $networkOutput = & $docker.Source --host $hostAddress network ls --format '{{.Name}}'
         if ($LASTEXITCODE -ne 0 -or $networkOutput -notcontains 'bridge') { throw "Docker CLI network list failed: $networkOutput" }
         $bridgeDriver = & $docker.Source --host $hostAddress network inspect bridge --format '{{.Driver}}'
         if ($LASTEXITCODE -ne 0 -or $bridgeDriver -ne 'bridge') { throw "Docker CLI network inspect failed: $bridgeDriver" }
+        $cliNetwork = "omnark-cli-net-$suffix"
+        $createdId = & $docker.Source --host $hostAddress network create $cliNetwork
+        if ($LASTEXITCODE -ne 0 -or $createdId -notmatch '^[a-f0-9]{64}$') { throw "Docker CLI network create failed: $createdId" }
+        $cliNetworkName = & $docker.Source --host $hostAddress network inspect $cliNetwork --format '{{.Name}}'
+        if ($LASTEXITCODE -ne 0 -or $cliNetworkName -ne $cliNetwork) { throw 'Docker CLI created network inspection failed.' }
+        $removedName = & $docker.Source --host $hostAddress network rm $cliNetwork
+        if ($LASTEXITCODE -ne 0 -or $removedName -ne $cliNetwork) { throw "Docker CLI network removal failed: $removedName" }
     }
-    if ($ProbeNetworkOnly) { Write-Host 'PASS: Engine API and Docker CLI network list/inspect.'; return }
+    if ($ProbeNetworkOnly) { Write-Host 'PASS: Engine API and Docker CLI network list/inspect/create/connect/disconnect/remove.'; return }
     $version = Invoke-EngineHttp 'GET' '/version'
     if ($version -notmatch '"ApiVersion":"1\.40"') { throw "API version failed: $version" }
     if ((Invoke-EngineHttp 'GET' '/not-implemented') -notmatch '^HTTP/1\.1 501 Not Implemented') { throw 'Unsupported API endpoint was not rejected.' }
@@ -290,3 +331,4 @@ try {
     }
     if (Test-Path -LiteralPath $storage) { Write-Warning "Temporary test storage remains locked: $storage" }
 }
+
