@@ -235,6 +235,16 @@ try {
     $exitWait = Invoke-EngineHttp 'POST' "/v1.40/containers/$exitContainer/wait"
     if ($exitWait -notmatch '^HTTP/1\.1 200 OK' -or $exitWait -notmatch '"StatusCode":7') { throw "API running-container wait failed: $exitWait" }
     if ((Invoke-EngineHttp 'DELETE' "/v1.40/containers/$exitContainer") -notmatch '^HTTP/1\.1 204 No Content') { throw 'API exit-code test cleanup failed.' }
+    $largeLogContainer = "omnark-large-log-$suffix"
+    $largeLogBody = @{ Image = 'docker.io/library/alpine:3.24'; Cmd = @('/bin/sh', '-c', 'yes x | head -c 90000') } | ConvertTo-Json -Compress
+    if ((Invoke-EngineHttp 'POST' "/v1.40/containers/create?name=$largeLogContainer" $largeLogBody) -notmatch '^HTTP/1\.1 201 Created') { throw 'Large-log container creation failed.' }
+    if ((Invoke-EngineHttp 'POST' "/v1.40/containers/$largeLogContainer/start") -notmatch '^HTTP/1\.1 204 No Content') { throw 'Large-log container start failed.' }
+    if ((Invoke-EngineHttp 'POST' "/v1.40/containers/$largeLogContainer/wait") -notmatch '^HTTP/1\.1 200 OK') { throw 'Large-log container wait failed.' }
+    $largeLogResponse = Invoke-EngineHttp 'GET' "/v1.40/containers/$largeLogContainer/logs?stdout=1&stderr=1&tail=all"
+    $largeLogParts = $largeLogResponse.Split(@("`r`n`r`n"), 2, [StringSplitOptions]::None)
+    $largeLogLength = [regex]::Match($largeLogParts[0], '(?im)^Content-Length:\s*(\d+)\s*$')
+    if ($largeLogParts.Count -ne 2 -or !$largeLogLength.Success -or [int]$largeLogLength.Groups[1].Value -lt 65536 -or [Text.Encoding]::UTF8.GetByteCount($largeLogParts[1]) -ne [int]$largeLogLength.Groups[1].Value) { throw 'Large API log response was truncated.' }
+    if ((Invoke-EngineHttp 'DELETE' "/v1.40/containers/$largeLogContainer") -notmatch '^HTTP/1\.1 204 No Content') { throw 'Large-log container cleanup failed.' }
     $pruneCreated = Invoke-Engine @{ op = 'create'; name = $container; image = 'docker.io/library/alpine:3.24'; command = @('/bin/sh', '-c', 'sleep 60') }
     $pruned = Invoke-EngineHttp 'POST' '/v1.40/containers/prune?filters=%7B%7D'
     if ($pruned -notmatch '^HTTP/1\.1 200 OK' -or $pruned -notmatch [regex]::Escape($pruneCreated.id)) { throw 'Prune did not remove the stopped container.' }

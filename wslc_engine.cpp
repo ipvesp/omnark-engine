@@ -1492,9 +1492,14 @@ static int serve_http_pipe(WslcSession session, HANDLE stop, HANDLE terminated, 
         } catch (...) {
             response = http_error(500, "Internal Server Error", "Engine API request failed");
         }
-        DWORD sent = 0;
-        pipe_io(pipe, true, response.data(), static_cast<DWORD>(response.size()), sent, stop, terminated);
-        FlushFileBuffers(pipe);
+        size_t offset = 0;
+        while (offset < response.size()) {
+            DWORD sent = 0;
+            const DWORD chunk = static_cast<DWORD>(std::min<size_t>(16384, response.size() - offset));
+            if (!pipe_io(pipe, true, response.data() + offset, chunk, sent, stop, terminated) || sent == 0) break;
+            offset += sent;
+        }
+        if (offset == response.size()) FlushFileBuffers(pipe);
         DisconnectNamedPipe(pipe);
         CloseHandle(pipe);
     }
